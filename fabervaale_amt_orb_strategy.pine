@@ -450,14 +450,15 @@ if goLong
     float tp2 = isLongRev and revUseMagnet and not na(tgtRev) and tgtRev > close ? tgtRev : tgtCont
     float tp1 = close + risk * tp1R
     float q = f_qty(close, stp)
+    string mdl = isLongCont ? "A-Cont" : "B-Rev"
     if q > 0
-        strategy.entry("Long", strategy.long, qty = q, alert_message = "FV-AMT LONG @ {{close}}")
+        strategy.entry("Long", strategy.long, qty = q, comment = mdl, alert_message = "FV-AMT LONG " + mdl)
         pStop := stp
         pTP1  := tp1
         pTP2  := tp2
         entryBar := bar_index
         tradesToday += 1
-        alert("FV-AMT LONG signal | entry=" + str.tostring(close) + " stop=" + str.tostring(stp) + " tp=" + str.tostring(tp2), alert.freq_once_per_bar_close)
+        alert("FV-AMT LONG " + mdl + " | entry=" + str.tostring(close) + " stop=" + str.tostring(stp) + " tp=" + str.tostring(tp2), alert.freq_once_per_bar_close)
 
 if goShort
     float stp = swingHigh + atr * stopBufAtr
@@ -472,14 +473,15 @@ if goShort
     float tp2 = isShortRev and revUseMagnet and not na(tgtRev) and tgtRev < close ? tgtRev : tgtCont
     float tp1 = close - risk * tp1R
     float q = f_qty(close, stp)
+    string mdl = isShortCont ? "A-Cont" : "B-Rev"
     if q > 0
-        strategy.entry("Short", strategy.short, qty = q, alert_message = "FV-AMT SHORT @ {{close}}")
+        strategy.entry("Short", strategy.short, qty = q, comment = mdl, alert_message = "FV-AMT SHORT " + mdl)
         pStop := stp
         pTP1  := tp1
         pTP2  := tp2
         entryBar := bar_index
         tradesToday += 1
-        alert("FV-AMT SHORT signal | entry=" + str.tostring(close) + " stop=" + str.tostring(stp) + " tp=" + str.tostring(tp2), alert.freq_once_per_bar_close)
+        alert("FV-AMT SHORT " + mdl + " | entry=" + str.tostring(close) + " stop=" + str.tostring(stp) + " tp=" + str.tostring(tp2), alert.freq_once_per_bar_close)
 
 // =============================================================================
 //  EXITS
