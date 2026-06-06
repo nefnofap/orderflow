@@ -1,0 +1,539 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+//@version=6
+
+// =============================================================================
+//  FABERVAALE AMT / ORB SIGNAL ENGINE  (Pine Script v6)
+// =============================================================================
+//  An algorithmic reconstruction of the trading approach popularised by
+//  Fabio Valentini ("Fabervaale"): Auction Market Theory (AMT) + order flow.
+//
+//  IMPORTANT: Fabio's exact numeric rules are proprietary. This is a faithful
+//  framework reconstruction. EVERY threshold below is a starting parameter to
+//  be backtested / walk-forward optimised, NOT a guaranteed setting.
+//
+//  CORE IDEA --------------------------------------------------------------
+//  The market is a two-way auction alternating between BALANCE (choppy, no edge)
+//  and IMBALANCE (trending, tradeable). We:
+//    1. Build the auction map  -> Session Volume Profile (POC / VAH / VAL),
+//                                 VWAP + StdDev bands, Opening Range, PDH/PDL.
+//    2. Read aggression        -> CVD (proxy from OHLC, or true intrabar delta),
+//                                 Absorption + CVD Divergence.
+//    3. Classify the regime    -> BALANCE vs IMBALANCE (the no-trade filter).
+//    4. Fire two mirror setups -> Model A: continuation (value accepted beyond
+//                                 a key level, CVD aligned -> toward next magnet)
+//                              -> Model B: reversion (failed auction at an edge /
+//                                 VWAP extreme + absorption/divergence -> to POC/VWAP)
+//    5. Score confluence       -> weighted sum >= threshold to take the trade.
+//    6. Manage risk            -> structural stop, R / magnet targets, fixed-
+//                                 fractional sizing, daily caps, cooldown.
+//
+//  MULTI-INSTRUMENT: Works on futures, stocks, FX and crypto PERPETUALS.
+//  - For 24/7 perps set Market Type = "24h (crypto perps)" so the daily anchor
+//    (VWAP / profile / opening range) resets at exchange midnight.
+//  - Bin width auto-scales per instrument from the prior day's range, so the
+//    volume profile is meaningful on NQ, BTCUSDT.P, ES, SPX, etc. without
+//    manual tuning.
+// =============================================================================
+
+strategy(title              = "Fabervaale AMT/ORB Signal Engine",
+         shorttitle         = "FV-AMT",
+         overlay            = true,
+         pyramiding         = 0,
+         initial_capital    = 10000,
+         default_qty_type   = strategy.fixed,
+         default_qty_value  = 1,
+         commission_type    = strategy.commission.percent,
+         commission_value   = 0.0,
+         process_orders_on_close = true,
+         calc_on_every_tick = false,
+         max_bars_back      = 500)
+
+// =============================================================================
+//  INPUTS
+// =============================================================================
+grpMkt = "1) Market / Session"
+marketType = input.string("Session-based (futures/stocks RTH)", "Market type",
+     options = ["Session-based (futures/stocks RTH)", "24h (crypto perps)"], group = grpMkt)
+anchorSession = input.session("0930-1600", "Trading / anchor session (RTH mode)", group = grpMkt,
+     tooltip = "Used only in Session-based mode. VWAP, profile and opening range anchor to this window.")
+sessTz       = input.string("America/New_York", "Session timezone", group = grpMkt)
+flattenEOD   = input.bool(true,  "Flatten at session end (RTH mode)", group = grpMkt)
+
+grpOR = "2) Opening Range"
+useOR     = input.bool(true, "Use Opening Range levels", group = grpOR)
+orMinutes = input.int(15, "Opening range length (minutes)", minval = 1, group = grpOR,
+     tooltip = "First N minutes after the anchor open. Common: 5 / 15 / 30. Backtest per instrument.")
+requireOR = input.bool(true, "Only trade after OR has formed", group = grpOR)
+
+grpProf = "3) Volume Profile (auction map)"
+profBins  = input.int(40, "Profile resolution (bins)", minval = 10, maxval = 150, group = grpProf)
+vaPct     = input.float(70, "Value Area %", minval = 50, maxval = 90, group = grpProf)
+lvnFactor = input.float(0.4, "LVN factor (bin vol < factor x avg = vacuum)", minval = 0.05, maxval = 1.0, group = grpProf)
+useVA     = input.bool(true, "Use VAH/VAL as key levels", group = grpProf)
+
+grpVwap = "4) VWAP + StdDev bands"
+band1 = input.float(1.0, "Band 1 (sigma)", minval = 0.25, group = grpVwap)
+band2 = input.float(2.0, "Band 2 (sigma, extreme)", minval = 0.5, group = grpVwap)
+
+grpFlow = "5) Order Flow (CVD)"
+cvdMode      = input.string("Proxy (OHLC)", "CVD source",
+     options = ["Proxy (OHLC)", "Intrabar (lower TF)"], group = grpFlow,
+     tooltip = "Proxy works everywhere from OHLCV. Intrabar uses lower-timeframe up/down volume for a truer delta.")
+ltfRes       = input.timeframe("1", "Intrabar resolution", group = grpFlow)
+cvdSlopeLen  = input.int(5, "CVD slope length (bars)", minval = 1, group = grpFlow)
+absVolFactor = input.float(1.8, "Absorption: volume > factor x avg", minval = 1.0, group = grpFlow)
+absRngFactor = input.float(0.5, "Absorption: range < factor x ATR", minval = 0.1, group = grpFlow)
+divLen       = input.int(14, "Divergence lookback (bars)", minval = 3, group = grpFlow)
+
+grpReg = "6) Regime filter"
+regimeLen = input.int(20, "ATR regime length", minval = 5, group = grpReg)
+expFactor = input.float(1.1, "Expansion factor (ATR > factor x avgATR = imbalance)", minval = 1.0, group = grpReg)
+
+grpSetup = "7) Setups & key levels"
+usePD      = input.bool(true,  "Use Prior Day High/Low as key levels", group = grpSetup)
+enableCont = input.bool(true,  "Enable Model A (continuation)", group = grpSetup)
+enableRev  = input.bool(true,  "Enable Model B (reversion)", group = grpSetup)
+
+grpScore = "8) Confluence score (weights)"
+thr      = input.float(0.60, "Entry threshold (0..1)", minval = 0.1, maxval = 1.0, group = grpScore)
+wRegime  = input.float(0.30, "Weight: regime aligned", minval = 0, group = grpScore)
+wCVD     = input.float(0.25, "Weight: CVD aligned / diverging", minval = 0, group = grpScore)
+wLevel   = input.float(0.15, "Weight: at/through key level", minval = 0, group = grpScore)
+wAbsorp  = input.float(0.15, "Weight: absorption", minval = 0, group = grpScore)
+wBar     = input.float(0.10, "Weight: confirming bar", minval = 0, group = grpScore)
+wLVN     = input.float(0.05, "Weight: LVN vacuum (continuation)", minval = 0, group = grpScore)
+
+grpRisk = "9) Risk management"
+sizingMode  = input.string("Risk %", "Sizing mode", options = ["Risk %", "Fixed qty"], group = grpRisk)
+riskPct     = input.float(0.5, "Risk % of equity per trade", minval = 0.05, maxval = 5.0, group = grpRisk)
+fixedQty    = input.float(1, "Fixed qty", minval = 0.0, group = grpRisk)
+allowFrac   = input.bool(true, "Allow fractional qty (crypto)", group = grpRisk)
+swingLen    = input.int(10, "Structural stop swing length", minval = 2, group = grpRisk)
+stopBufAtr  = input.float(0.25, "Stop buffer (x ATR)", minval = 0, group = grpRisk)
+rrTarget    = input.float(2.0, "Continuation target (R multiple)", minval = 0.5, group = grpRisk)
+revUseMagnet= input.bool(true, "Reversion target = POC/VWAP magnet", group = grpRisk)
+scaleOut    = input.bool(true, "Scale out (TP1 partial + runner)", group = grpRisk)
+tp1Pct      = input.int(50, "TP1 size % (scale out)", minval = 10, maxval = 90, group = grpRisk)
+tp1R        = input.float(1.0, "TP1 (R multiple)", minval = 0.25, group = grpRisk)
+
+grpGuard = "10) Guardrails"
+maxTrades    = input.int(5, "Max trades per day", minval = 1, group = grpGuard)
+maxDailyLoss = input.float(2.0, "Daily loss limit (% equity)", minval = 0.25, group = grpGuard)
+cooldownBars = input.int(3, "Cooldown bars after a trade", minval = 0, group = grpGuard)
+useTimeExit  = input.bool(false, "Time-based exit", group = grpGuard)
+maxBars      = input.int(40, "Max bars in trade", minval = 1, group = grpGuard)
+
+grpViz = "11) Visuals"
+showLevels = input.bool(true, "Show levels", group = grpViz)
+showRegime = input.bool(true, "Shade regime background", group = grpViz)
+
+// =============================================================================
+//  SESSION / ANCHOR CLOCK
+// =============================================================================
+inSess     = not na(time(timeframe.period, anchorSession, sessTz))
+sessStart  = inSess and not inSess[1]
+sessEnd    = (not inSess) and inSess[1]
+newDay     = timeframe.change("D")
+useSession = marketType == "Session-based (futures/stocks RTH)"
+
+anchorReset = useSession ? sessStart : newDay
+inWindow    = useSession ? inSess : true
+
+float hlc3v = (high + low + close) / 3.0
+float atr   = ta.atr(14)
+
+// -----------------------------------------------------------------------------
+//  Prior Day High / Low (always daily based)
+// -----------------------------------------------------------------------------
+var float pdh    = na
+var float pdl    = na
+var float curDayH = na
+var float curDayL = na
+if newDay
+    pdh := curDayH
+    pdl := curDayL
+    curDayH := high
+    curDayL := low
+else
+    curDayH := na(curDayH) ? high : math.max(curDayH, high)
+    curDayL := na(curDayL) ? low  : math.min(curDayL, low)
+
+// =============================================================================
+//  OPENING RANGE
+// =============================================================================
+var float orh     = na
+var float orl     = na
+var int   orEnd   = na
+var bool  orDone  = false
+if anchorReset
+    orh   := high
+    orl   := low
+    orEnd := time + orMinutes * 60 * 1000
+    orDone := false
+else if (not na(orEnd)) and time < orEnd
+    orh := math.max(orh, high)
+    orl := math.min(orl, low)
+else if not na(orEnd)
+    orDone := true
+
+// =============================================================================
+//  VWAP + STDDEV BANDS  (volume weighted, resets on anchor)
+// =============================================================================
+var float cumPV  = 0.0
+var float cumV   = 0.0
+var float cumPV2 = 0.0
+if anchorReset
+    cumPV  := 0.0
+    cumV   := 0.0
+    cumPV2 := 0.0
+cumPV  += hlc3v * volume
+cumV   += volume
+cumPV2 += hlc3v * hlc3v * volume
+
+float vwap = cumV > 0 ? cumPV / cumV : na
+float vwVar = cumV > 0 ? cumPV2 / cumV - vwap * vwap : 0.0
+float vwSd  = vwVar > 0 ? math.sqrt(vwVar) : 0.0
+float vwU1 = vwap + vwSd * band1
+float vwL1 = vwap - vwSd * band1
+float vwU2 = vwap + vwSd * band2
+float vwL2 = vwap - vwSd * band2
+
+// =============================================================================
+//  CVD  (cumulative volume delta)  — proxy or intrabar
+// =============================================================================
+ltfClose = request.security_lower_tf(syminfo.tickerid, ltfRes, close)
+ltfOpen  = request.security_lower_tf(syminfo.tickerid, ltfRes, open)
+ltfVol   = request.security_lower_tf(syminfo.tickerid, ltfRes, volume)
+
+float barDelta = na
+if cvdMode == "Intrabar (lower TF)" and array.size(ltfClose) > 0 and array.size(ltfVol) == array.size(ltfClose)
+    float dd = 0.0
+    for i = 0 to array.size(ltfClose) - 1
+        float c = array.get(ltfClose, i)
+        float o = array.get(ltfOpen, i)
+        float v = array.get(ltfVol, i)
+        if c >= o
+            dd += v
+        else
+            dd -= v
+    barDelta := dd
+if na(barDelta)
+    float rng0 = high - low
+    if rng0 > 0
+        barDelta := volume * ((close - low) - (high - close)) / rng0
+    else
+        barDelta := 0.0
+
+var float cvd = 0.0
+if anchorReset
+    cvd := 0.0
+cvd += barDelta
+
+float cvdSlope = cvd - cvd[cvdSlopeLen]
+bool  cvdUp    = cvdSlope > 0
+bool  cvdDn    = cvdSlope < 0
+
+// Absorption: lots of participation, little price travel
+float volMA      = ta.sma(volume, 20)
+float barRange   = high - low
+bool  absorption = volume > volMA * absVolFactor and barRange < atr * absRngFactor
+
+// CVD divergence (rolling approximation)
+// Hoist ta.* to globals so they execute every bar (avoids inconsistent history).
+float lowestLow   = ta.lowest(low,  divLen)
+float lowestCvd   = ta.lowest(cvd,  divLen)
+float highestHigh = ta.highest(high, divLen)
+float highestCvd  = ta.highest(cvd, divLen)
+bool bullDiv = low  < lowestLow[1]   and cvd > lowestCvd[1]
+bool bearDiv = high > highestHigh[1] and cvd < highestCvd[1]
+
+// =============================================================================
+//  SESSION VOLUME PROFILE  (incremental, adaptive bin width)
+//  Implemented with a map<int,float> keyed by bin index -> no history indexing.
+// =============================================================================
+var map<int, float> prof = map.new<int, float>()
+var float binW = na
+
+if anchorReset
+    float rngEst = (not na(pdh) and not na(pdl) and pdh > pdl) ? (pdh - pdl) : (high - low) * 10.0
+    binW := math.max(syminfo.mintick, rngEst / profBins)
+    map.clear(prof)
+
+if not na(binW) and binW > 0
+    int key = int(math.floor(hlc3v / binW))
+    float cur = map.contains(prof, key) ? map.get(prof, key) : 0.0
+    map.put(prof, key, cur + volume)
+
+// Derive POC / VAH / VAL / LVN from the map
+float poc = na
+float vah = na
+float val = na
+bool  inLVN = false
+
+if not na(binW) and binW > 0 and map.size(prof) > 0
+    keys = map.keys(prof)
+    int n = array.size(keys)
+    // total + POC
+    float total = 0.0
+    float pocVol = -1.0
+    int pocKey = na
+    for i = 0 to n - 1
+        int k = array.get(keys, i)
+        float v = map.get(prof, k)
+        total += v
+        if v > pocVol
+            pocVol := v
+            pocKey := k
+    // sort keys ascending and locate POC position
+    array.sort(keys, order.ascending)
+    int pocPos = 0
+    for i = 0 to n - 1
+        if array.get(keys, i) == pocKey
+            pocPos := i
+            break
+    // expand value area from POC
+    float target = total * vaPct / 100.0
+    int lo = pocPos
+    int hi = pocPos
+    float cum = pocVol
+    for step = 0 to n
+        if cum >= target
+            break
+        float vBelow = lo > 0 ? map.get(prof, array.get(keys, lo - 1)) : -1.0
+        float vAbove = hi < n - 1 ? map.get(prof, array.get(keys, hi + 1)) : -1.0
+        if vBelow < 0 and vAbove < 0
+            break
+        if vAbove >= vBelow
+            hi += 1
+            cum += vAbove
+        else
+            lo -= 1
+            cum += vBelow
+    poc := (pocKey + 0.5) * binW
+    val := array.get(keys, lo) * binW
+    vah := (array.get(keys, hi) + 1) * binW
+    // LVN check at current price
+    int curKey = int(math.floor(hlc3v / binW))
+    float curVol = map.contains(prof, curKey) ? map.get(prof, curKey) : 0.0
+    float avgBin = n > 0 ? total / n : 0.0
+    inLVN := avgBin > 0 and curVol < avgBin * lvnFactor
+
+// =============================================================================
+//  REGIME CLASSIFIER  (balance vs imbalance) — the no-trade filter
+// =============================================================================
+float atrAvg   = ta.sma(atr, regimeLen)
+bool  expansion = atr > atrAvg * expFactor
+bool  inValue   = (not na(vah) and not na(val)) and close <= vah and close >= val
+bool  imbalance = (not inValue) or expansion
+bool  balance   = not imbalance
+
+// =============================================================================
+//  KEY-LEVEL BREAK / EXTREME LOGIC
+// =============================================================================
+// Upper breakouts (continuation long)
+// Hoist ta.crossover/crossunder to globals so they run every bar.
+bool xoVA = ta.crossover(close, vah)
+bool xoOR = ta.crossover(close, orh)
+bool xoPD = ta.crossover(close, pdh)
+bool xuVA = ta.crossunder(close, val)
+bool xuOR = ta.crossunder(close, orl)
+bool xuPD = ta.crossunder(close, pdl)
+
+bool xUpVA = useVA and not na(vah) and xoVA
+bool xUpOR = useOR and orDone and not na(orh) and xoOR
+bool xUpPD = usePD and not na(pdh) and xoPD
+bool breakoutUp = xUpVA or xUpOR or xUpPD
+
+// Lower breakouts (continuation short)
+bool xDnVA = useVA and not na(val) and xuVA
+bool xDnOR = useOR and orDone and not na(orl) and xuOR
+bool xDnPD = usePD and not na(pdl) and xuPD
+bool breakoutDn = xDnVA or xDnOR or xDnPD
+
+// Extremes (reversion) — stretched beyond value edge or VWAP band 2
+bool longExtreme  = (not na(val) and low  < val) or (not na(vwL2) and low  < vwL2)
+bool shortExtreme = (not na(vah) and high > vah) or (not na(vwU2) and high > vwU2)
+bool longReject   = close > open and ((not na(val) and close > val) or (not na(vwL1) and close > vwL1))
+bool shortReject  = close < open and ((not na(vah) and close < vah) or (not na(vwU1) and close < vwU1))
+
+// =============================================================================
+//  SETUP TRIGGERS
+// =============================================================================
+bool isLongCont  = enableCont and imbalance and breakoutUp and cvdUp
+bool isShortCont = enableCont and imbalance and breakoutDn and cvdDn
+bool isLongRev   = enableRev  and longExtreme  and longReject  and (absorption or bullDiv)
+bool isShortRev  = enableRev  and shortExtreme and shortReject and (absorption or bearDiv)
+
+bool longTrigger  = isLongCont  or isLongRev
+bool shortTrigger = isShortCont or isShortRev
+
+// =============================================================================
+//  CONFLUENCE SCORE
+// =============================================================================
+float longScore = 0.0
+longScore += imbalance ? wRegime : 0.0
+longScore += cvdUp or bullDiv ? wCVD : 0.0
+longScore += breakoutUp or longExtreme ? wLevel : 0.0
+longScore += absorption ? wAbsorp : 0.0
+longScore += close > open ? wBar : 0.0
+longScore += inLVN and isLongCont ? wLVN : 0.0
+
+float shortScore = 0.0
+shortScore += imbalance ? wRegime : 0.0
+shortScore += cvdDn or bearDiv ? wCVD : 0.0
+shortScore += breakoutDn or shortExtreme ? wLevel : 0.0
+shortScore += absorption ? wAbsorp : 0.0
+shortScore += close < open ? wBar : 0.0
+shortScore += inLVN and isShortCont ? wLVN : 0.0
+
+// =============================================================================
+//  DAILY GUARDRAILS
+// =============================================================================
+var int   tradesToday    = 0
+var float dayStartEquity = na
+var int   cooldownUntil  = 0
+if anchorReset
+    tradesToday := 0
+    dayStartEquity := strategy.equity
+float dayLoss      = na(dayStartEquity) ? 0.0 : dayStartEquity - strategy.equity
+bool  lossLimitHit = (not na(dayStartEquity)) and dayLoss >= dayStartEquity * maxDailyLoss / 100.0
+
+bool justClosed = strategy.position_size == 0 and strategy.position_size[1] != 0
+if justClosed
+    cooldownUntil := bar_index + cooldownBars
+
+bool flat = strategy.position_size == 0
+bool canTrade = inWindow and (not requireOR or orDone) and tradesToday < maxTrades and bar_index >= cooldownUntil and not lossLimitHit and flat
+
+// =============================================================================
+//  ENTRY DECISION
+// =============================================================================
+bool goLongRaw  = longTrigger  and longScore  >= thr
+bool goShortRaw = shortTrigger and shortScore >= thr
+// if both fire, take the stronger
+bool goLong  = goLongRaw  and (not goShortRaw or longScore >= shortScore) and canTrade
+bool goShort = goShortRaw and (not goLongRaw  or shortScore > longScore) and canTrade
+
+// -----------------------------------------------------------------------------
+//  Stops / targets / sizing helpers
+// -----------------------------------------------------------------------------
+float swingLow  = ta.lowest(low,  swingLen)
+float swingHigh = ta.highest(high, swingLen)
+
+f_qty(_entry, _stop) =>
+    float q = fixedQty
+    if sizingMode == "Risk %"
+        float dist = math.abs(_entry - _stop)
+        float riskCap = strategy.equity * riskPct / 100.0
+        float pv = syminfo.pointvalue > 0 ? syminfo.pointvalue : 1.0
+        float raw = dist > 0 ? riskCap / (dist * pv) : 0.0
+        q := allowFrac ? raw : math.floor(raw)
+    if not allowFrac
+        q := math.max(1, q)
+    q
+
+var float pStop = na
+var float pTP1  = na
+var float pTP2  = na
+var int   entryBar = na
+
+if goLong
+    float stp = swingLow - atr * stopBufAtr
+    float risk = close - stp
+    if risk <= 0
+        risk := atr
+        stp := close - risk
+    float tgtCont = close + risk * rrTarget
+    float tgtRev  = na
+    if revUseMagnet
+        tgtRev := not na(poc) ? poc : vwap
+    float tp2 = isLongRev and revUseMagnet and not na(tgtRev) and tgtRev > close ? tgtRev : tgtCont
+    float tp1 = close + risk * tp1R
+    float q = f_qty(close, stp)
+    string mdl = isLongCont ? "A-Cont" : "B-Rev"
+    if q > 0
+        strategy.entry("Long", strategy.long, qty = q, comment = mdl, alert_message = "FV-AMT LONG " + mdl)
+        pStop := stp
+        pTP1  := tp1
+        pTP2  := tp2
+        entryBar := bar_index
+        tradesToday += 1
+        alert("FV-AMT LONG " + mdl + " | entry=" + str.tostring(close) + " stop=" + str.tostring(stp) + " tp=" + str.tostring(tp2), alert.freq_once_per_bar_close)
+
+if goShort
+    float stp = swingHigh + atr * stopBufAtr
+    float risk = stp - close
+    if risk <= 0
+        risk := atr
+        stp := close + risk
+    float tgtCont = close - risk * rrTarget
+    float tgtRev  = na
+    if revUseMagnet
+        tgtRev := not na(poc) ? poc : vwap
+    float tp2 = isShortRev and revUseMagnet and not na(tgtRev) and tgtRev < close ? tgtRev : tgtCont
+    float tp1 = close - risk * tp1R
+    float q = f_qty(close, stp)
+    string mdl = isShortCont ? "A-Cont" : "B-Rev"
+    if q > 0
+        strategy.entry("Short", strategy.short, qty = q, comment = mdl, alert_message = "FV-AMT SHORT " + mdl)
+        pStop := stp
+        pTP1  := tp1
+        pTP2  := tp2
+        entryBar := bar_index
+        tradesToday += 1
+        alert("FV-AMT SHORT " + mdl + " | entry=" + str.tostring(close) + " stop=" + str.tostring(stp) + " tp=" + str.tostring(tp2), alert.freq_once_per_bar_close)
+
+// =============================================================================
+//  EXITS
+// =============================================================================
+if strategy.position_size > 0
+    if scaleOut
+        strategy.exit("L-TP1", from_entry = "Long", qty_percent = tp1Pct, limit = pTP1, stop = pStop)
+        strategy.exit("L-TP2", from_entry = "Long", limit = pTP2, stop = pStop)
+    else
+        strategy.exit("L-X", from_entry = "Long", limit = pTP2, stop = pStop)
+
+if strategy.position_size < 0
+    if scaleOut
+        strategy.exit("S-TP1", from_entry = "Short", qty_percent = tp1Pct, limit = pTP1, stop = pStop)
+        strategy.exit("S-TP2", from_entry = "Short", limit = pTP2, stop = pStop)
+    else
+        strategy.exit("S-X", from_entry = "Short", limit = pTP2, stop = pStop)
+
+// Time-based exit
+if useTimeExit and not flat and not na(entryBar) and bar_index - entryBar >= maxBars
+    strategy.close_all(comment = "TimeExit")
+
+// Flatten at session end (RTH mode)
+if flattenEOD and useSession and sessEnd and not flat
+    strategy.close_all(comment = "EOD")
+
+// =============================================================================
+//  VISUALS
+// =============================================================================
+plot(showLevels ? vwap : na, "VWAP", color = color.new(color.orange, 0), linewidth = 2)
+plot(showLevels ? vwU1 : na, "VWAP +1s", color = color.new(color.orange, 60))
+plot(showLevels ? vwL1 : na, "VWAP -1s", color = color.new(color.orange, 60))
+plot(showLevels ? vwU2 : na, "VWAP +2s", color = color.new(color.orange, 80))
+plot(showLevels ? vwL2 : na, "VWAP -2s", color = color.new(color.orange, 80))
+
+plot(showLevels ? poc : na, "POC", color = color.new(color.fuchsia, 0), linewidth = 2, style = plot.style_linebr)
+plot(showLevels ? vah : na, "VAH", color = color.new(color.teal, 0),    style = plot.style_linebr)
+plot(showLevels ? val : na, "VAL", color = color.new(color.teal, 0),    style = plot.style_linebr)
+
+plot(showLevels and useOR ? orh : na, "OR High", color = color.new(color.blue, 0), style = plot.style_linebr)
+plot(showLevels and useOR ? orl : na, "OR Low",  color = color.new(color.blue, 0), style = plot.style_linebr)
+plot(showLevels and usePD ? pdh : na, "PDH", color = color.new(color.gray, 30), style = plot.style_linebr)
+plot(showLevels and usePD ? pdl : na, "PDL", color = color.new(color.gray, 30), style = plot.style_linebr)
+
+bgcolor(showRegime ? (imbalance ? color.new(color.green, 92) : color.new(color.gray, 95)) : na, title = "Regime")
+
+plotshape(goLong,  title = "Long",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.green, 0), size = size.small, text = "L")
+plotshape(goShort, title = "Short", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),   size = size.small, text = "S")
+
+// =============================================================================
+//  ALERTS
+// =============================================================================
+// Signal alerts are fired via alert() in the entry blocks above.
+// To receive them: add the strategy to a chart, create an alert, and set the
+// condition to this strategy with "alert() function calls only".
