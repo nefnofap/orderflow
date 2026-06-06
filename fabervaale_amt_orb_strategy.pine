@@ -239,8 +239,13 @@ float barRange   = high - low
 bool  absorption = volume > volMA * absVolFactor and barRange < atr * absRngFactor
 
 // CVD divergence (rolling approximation)
-bool bullDiv = low  < ta.lowest(low,  divLen)[1] and cvd > ta.lowest(cvd, divLen)[1]
-bool bearDiv = high > ta.highest(high, divLen)[1] and cvd < ta.highest(cvd, divLen)[1]
+// Hoist ta.* to globals so they execute every bar (avoids inconsistent history).
+float lowestLow   = ta.lowest(low,  divLen)
+float lowestCvd   = ta.lowest(cvd,  divLen)
+float highestHigh = ta.highest(high, divLen)
+float highestCvd  = ta.highest(cvd, divLen)
+bool bullDiv = low  < lowestLow[1]   and cvd > lowestCvd[1]
+bool bearDiv = high > highestHigh[1] and cvd < highestCvd[1]
 
 // =============================================================================
 //  SESSION VOLUME PROFILE  (incremental, adaptive bin width)
@@ -326,15 +331,23 @@ bool  balance   = not imbalance
 //  KEY-LEVEL BREAK / EXTREME LOGIC
 // =============================================================================
 // Upper breakouts (continuation long)
-bool xUpVA = useVA and not na(vah) and ta.crossover(close, vah)
-bool xUpOR = useOR and orDone and not na(orh) and ta.crossover(close, orh)
-bool xUpPD = usePD and not na(pdh) and ta.crossover(close, pdh)
+// Hoist ta.crossover/crossunder to globals so they run every bar.
+bool xoVA = ta.crossover(close, vah)
+bool xoOR = ta.crossover(close, orh)
+bool xoPD = ta.crossover(close, pdh)
+bool xuVA = ta.crossunder(close, val)
+bool xuOR = ta.crossunder(close, orl)
+bool xuPD = ta.crossunder(close, pdl)
+
+bool xUpVA = useVA and not na(vah) and xoVA
+bool xUpOR = useOR and orDone and not na(orh) and xoOR
+bool xUpPD = usePD and not na(pdh) and xoPD
 bool breakoutUp = xUpVA or xUpOR or xUpPD
 
 // Lower breakouts (continuation short)
-bool xDnVA = useVA and not na(val) and ta.crossunder(close, val)
-bool xDnOR = useOR and orDone and not na(orl) and ta.crossunder(close, orl)
-bool xDnPD = usePD and not na(pdl) and ta.crossunder(close, pdl)
+bool xDnVA = useVA and not na(val) and xuVA
+bool xDnOR = useOR and orDone and not na(orl) and xuOR
+bool xDnPD = usePD and not na(pdl) and xuPD
 bool breakoutDn = xDnVA or xDnOR or xDnPD
 
 // Extremes (reversion) — stretched beyond value edge or VWAP band 2
@@ -517,7 +530,8 @@ plotshape(goLong,  title = "Long",  style = shape.triangleup,   location = locat
 plotshape(goShort, title = "Short", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),   size = size.small, text = "S")
 
 // =============================================================================
-//  ALERTS (also usable on the indicator level)
+//  ALERTS
 // =============================================================================
-alertcondition(goLong,  title = "FV-AMT Long",  message = "FV-AMT LONG {{ticker}} @ {{close}}")
-alertcondition(goShort, title = "FV-AMT Short", message = "FV-AMT SHORT {{ticker}} @ {{close}}")
+// Signal alerts are fired via alert() in the entry blocks above.
+// To receive them: add the strategy to a chart, create an alert, and set the
+// condition to this strategy with "alert() function calls only".
